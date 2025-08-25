@@ -4,87 +4,53 @@ const https = require("https");
 const PORT = process.env.PORT || 3000;
 const TIME_URL = "https://time.com";
 
-//fetch htmlfrom url
-function getHTML(url, redirectsLeft = 5) {
+/* -------------------- HELPERS -------------------- */
+
+// fetch raw HTML from a URL
+function fetchHTML(url) {
   return new Promise((resolve, reject) => {
-    const req = https.get(
-      url,
-      {
-        headers: {
-          
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    https.get(url, (res) => {
+      let data = "";
 
-        },
-      },
-      (res) => {
-        // Handle redirects 
-        if (
-          res.statusCode >= 300 &&
-          res.statusCode < 400 &&
-          res.headers.location
-        ) {
-          if (redirectsLeft <= 0) {
-            reject(new Error("Too many redirects"));
-            res.resume();
-            return;
-          }
-          const next = res.headers.location.startsWith("http")
-            ? res.headers.location
-            : new URL(res.headers.location, url).href;
-          res.resume();
-          resolve(getHTML(next, redirectsLeft - 1));
-          return;
-        }
+      res.on("data", (chunk) => {
+        data += chunk;
+      });
 
-        if (res.statusCode !== 200) {
-          reject(new Error(`HTTP ${res.statusCode} when fetching ${url}`));
-          res.resume();
-          return;
-        }
-
-        res.setEncoding("utf8");
-        let html = "";
-        res.on("data", (chunk) => (html += chunk));
-        res.on("end", () => resolve(html));
-      }
-    );
-
-    req.on("error", reject);
+      res.on("end", () => {
+        resolve(data);
+      });
+    }).on("error", (err) => {
+      reject(err);
+    });
   });
 }
 
-//decode html entities
-function decodeEntities(s) {
-  return s
+// decode common HTML entities (&amp; → &, &quot; → ")
+function decodeEntities(text) {
+  return text
     .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
-    .replace(/&#39;|&apos;/g, "'")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&mdash;/g, "—")
-    .replace(/&ndash;/g, "–");
+    .replace(/&#039;/g, "'");
 }
 
-//etract stories
-function extractLatestStories(html, count = 6) {
+/* -------------------- STORY SCRAPER -------------------- */
 
+function extractLatestStories(html, count = 6) {
   let start = html.indexOf("LATEST STORIES");
 
-  
   if (start === -1) {
-    start = html.search(/latest-stories/i);
+    start = html.toLowerCase().indexOf("latest-stories");
   }
 
-  
   let slice;
   if (start !== -1) {
-   
     const ulStart = html.indexOf("<ul", start);
     const ulEnd = html.indexOf("</ul>", ulStart);
     if (ulStart !== -1 && ulEnd !== -1) {
       slice = html.slice(ulStart, ulEnd + 5);
     } else {
-  
       slice = html.slice(start, start + 20000);
     }
   } else {
@@ -92,50 +58,76 @@ function extractLatestStories(html, count = 6) {
   }
 
   const stories = [];
-  const anchorRegex = /<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-  let match;
+  let pos = 0;
 
-  while ((match = anchorRegex.exec(slice)) !== null) {
-    let href = match[1];
-    let text = match[2];
+  while (stories.length < count) {
+    let aStart = slice.indexOf("<a", pos);
+    if (aStart === -1) break;
 
-   
-    text = text.replace(/<[^>]+>/g, "").trim();
+    let hrefStart = slice.indexOf('href="', aStart);
+    if (hrefStart === -1) {
+      pos = aStart + 2;
+      continue;
+    }
+    hrefStart += 6;
+    let hrefEnd = slice.indexOf('"', hrefStart);
+    if (hrefEnd === -1) break;
+    let href = slice.substring(hrefStart, hrefEnd);
+
+    let textStart = slice.indexOf(">", hrefEnd) + 1;
+    let textEnd = slice.indexOf("</a>", textStart);
+    if (textEnd === -1) break;
+    let text = slice.substring(textStart, textEnd).trim();
+
+    // strip inner tags
+    while (text.includes("<")) {
+      let t1 = text.indexOf("<");
+      let t2 = text.indexOf(">", t1);
+      if (t2 === -1) break;
+      text = text.slice(0, t1) + text.slice(t2 + 1);
+    }
     text = decodeEntities(text);
 
-
-
-    if (!text) continue;
-if (/read more|subscribe|sign in|newsletter|skip to content|your brief/i.test(text)) continue;
-
-if (!href.startsWith("http") && !href.startsWith("/")) continue;
-if (!/\s/.test(text)) continue;
-//for numeric id
-if (!/\/\d{6,}/.test(href)) continue; 
-
+    // filtering rules
+    if (!text) {
+      pos = textEnd + 4;
+      continue;
+    }
+    if (/read more|subscribe|sign in|newsletter|skip to content|your brief/i.test(text)) {
+      pos = textEnd + 4;
+      continue;
+    }
+    if (!href.startsWith("http") && !href.startsWith("/")) {
+      pos = textEnd + 4;
+      continue;
+    }
+    if (!/\s/.test(text)) {
+      pos = textEnd + 4;
+      continue;
+    }
+    if (!/\/\d{6,}/.test(href)) {
+      pos = textEnd + 4;
+      continue;
+    }
 
     if (href.startsWith("/")) href = TIME_URL + href;
 
-    if (/\s/.test(text)) {
-      stories.push({ title: text, link: href });
-    }
+    stories.push({ title: text, link: href });
 
-    if (stories.length >= count) break;
+    pos = textEnd + 4;
   }
 
   return stories.slice(0, count);
 }
 
-//fetches parses and returns json
 async function getTimeStoriesJSON() {
-  const html = await getHTML(TIME_URL);
-  const items = extractLatestStories(html, 6);
-  return items;
+  const html = await fetchHTML(TIME_URL);
+  return extractLatestStories(html);
 }
 
-//create http server
+/* -------------------- SERVER -------------------- */
+
 const server = http.createServer(async (req, res) => {
-  // routing
   if (req.method === "GET" && req.url.startsWith("/getTimeStories")) {
     try {
       const data = await getTimeStoriesJSON();
@@ -146,24 +138,23 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify(data, null, 2));
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(
-
-        JSON.stringify({ error: "Failed to fetch/parse", details: String(err) })
-      );
+      res.end(JSON.stringify({ error: "Failed to fetch/parse", details: String(err) }));
     }
     return;
   }
 
+  if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
+    try {
+      const data = await getTimeStoriesJSON();
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Failed to fetch/parse", details: String(err) }));
+    }
+    return;
+  }
 
-if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
-  const data = await getTimeStoriesJSON(); // fetch latest stories
-  res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(data, null, 2));
-  return;
-}
-
-
-  // Not found
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("Not Found");
 });
